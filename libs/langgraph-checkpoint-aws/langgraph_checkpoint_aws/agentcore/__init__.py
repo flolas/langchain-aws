@@ -1,6 +1,9 @@
 from typing import Any
 
-from langgraph_checkpoint_aws.agentcore.saver import AgentCoreMemorySaver
+from langgraph_checkpoint_aws.agentcore.saver import (
+    AgentCoreMemorySaver,
+    AsyncAgentCoreMemorySaver,
+)
 from langgraph_checkpoint_aws.agentcore.store import AgentCoreMemoryStore
 
 # Store the import error for later use
@@ -28,6 +31,7 @@ except ImportError as e:
 
 __all__ = [
     "AgentCoreMemorySaver",
+    "AsyncAgentCoreMemorySaver",
     "AgentCoreMemoryStore",
     "AgentCoreValkeySaver",
     "valkey_available",

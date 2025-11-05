@@ -21,7 +21,6 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.constants import TASKS
 from pydantic import BaseModel, SecretStr
 
-from langgraph_checkpoint_aws import SDK_USER_AGENT
 from langgraph_checkpoint_aws.constants import CHECKPOINT_PREFIX, WRITES_PREFIX
 from langgraph_checkpoint_aws.models import (
     BedrockSessionContentBlock,
@@ -471,6 +470,9 @@ def create_client_config(config: Config | None = None) -> Config:
 
     """
     config_kwargs: dict[str, Any] = {}
+    # Import here to avoid circular import during module initialization
+    from langgraph_checkpoint_aws import SDK_USER_AGENT
+
     existing_user_agent = getattr(config, "user_agent_extra", "") if config else ""
     new_user_agent = (
         f"{existing_user_agent} x-client-framework:langgraph-checkpoint-aws "

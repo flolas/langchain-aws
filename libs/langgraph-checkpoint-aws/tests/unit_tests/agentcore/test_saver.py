@@ -3,7 +3,7 @@ Unit tests for AgentCore Memory Checkpoint Saver.
 """
 
 import json
-from unittest.mock import ANY, MagicMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -18,6 +18,7 @@ from langgraph_checkpoint_aws.agentcore.constants import (
 )
 from langgraph_checkpoint_aws.agentcore.helpers import (
     AgentCoreEventClient,
+    AsyncAgentCoreEventClient,
     EventProcessor,
     EventSerializer,
 )
@@ -28,7 +29,10 @@ from langgraph_checkpoint_aws.agentcore.models import (
     WriteItem,
     WritesEvent,
 )
-from langgraph_checkpoint_aws.agentcore.saver import AgentCoreMemorySaver
+from langgraph_checkpoint_aws.agentcore.saver import (
+    AgentCoreMemorySaver,
+    AsyncAgentCoreMemorySaver,
+)
 
 
 @pytest.fixture
@@ -858,6 +862,174 @@ class TestAgentCoreEventClient:
         assert mock_boto_client.delete_event.call_count == 2
 
 
+class TestAsyncAgentCoreEventClient:
+    """Test suite for AsyncAgentCoreEventClient."""
+
+    @pytest.fixture
+    def mock_boto_client(self):
+        mock_client = Mock()
+        mock_client.create_event = MagicMock()
+        mock_client.list_events = MagicMock()
+        mock_client.delete_event = MagicMock()
+        return mock_client
+
+    @pytest.fixture
+    def serializer(self):
+        return EventSerializer(JsonPlusSerializer())
+
+    @pytest.fixture
+    def client(self, mock_boto_client, serializer):
+        return AsyncAgentCoreEventClient(
+            "test-memory-id", serializer, client=mock_boto_client
+        )
+
+    @pytest.mark.asyncio
+    async def test_store_blob_event(
+        self, client, mock_boto_client, sample_checkpoint_event
+    ):
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.helpers.run_boto3_in_executor",
+            new_callable=AsyncMock,
+        ) as mock_executor:
+            await client.store_blob_event(
+                sample_checkpoint_event, "session_id", "actor_id"
+            )
+
+        mock_executor.assert_awaited_once()
+        call_args = mock_executor.call_args
+        assert call_args.args[0] is mock_boto_client.create_event
+        assert call_args.kwargs["memoryId"] == "test-memory-id"
+        assert call_args.kwargs["actorId"] == "actor_id"
+        assert call_args.kwargs["sessionId"] == "session_id"
+        assert len(call_args.kwargs["payload"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_store_blob_events_batch(
+        self,
+        client,
+        mock_boto_client,
+        sample_checkpoint_event,
+        sample_channel_data_event,
+    ):
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.helpers.run_boto3_in_executor",
+            new_callable=AsyncMock,
+        ) as mock_executor:
+            await client.store_blob_events_batch(
+                [sample_checkpoint_event, sample_channel_data_event],
+                "session_id",
+                "actor_id",
+            )
+
+        mock_executor.assert_awaited_once()
+        call_args = mock_executor.call_args
+        assert call_args.args[0] is mock_boto_client.create_event
+        assert len(call_args.kwargs["payload"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_get_events(
+        self, client, serializer, sample_checkpoint_event
+    ):
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.helpers.run_boto3_in_executor",
+            new_callable=AsyncMock,
+        ) as mock_executor:
+            mock_executor.return_value = {
+                "events": [
+                    {
+                        "eventId": "event_1",
+                        "payload": [
+                            {
+                                "blob": serializer.serialize_event(
+                                    sample_checkpoint_event
+                                )
+                            }
+                        ],
+                    }
+                ]
+            }
+
+            events = await client.get_events("session_id", "actor_id")
+
+        assert len(events) == 1
+        assert isinstance(events[0], CheckpointEvent)
+        mock_executor.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_events_with_pagination(
+        self, client, serializer, sample_checkpoint_event
+    ):
+        responses = [
+            {
+                "events": [
+                    {
+                        "eventId": "event_1",
+                        "payload": [
+                            {
+                                "blob": serializer.serialize_event(
+                                    sample_checkpoint_event
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "nextToken": "token_1",
+            },
+            {
+                "events": [
+                    {
+                        "eventId": "event_2",
+                        "payload": [
+                            {
+                                "blob": serializer.serialize_event(
+                                    sample_checkpoint_event
+                                )
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.helpers.run_boto3_in_executor",
+            new_callable=AsyncMock,
+        ) as mock_executor:
+            mock_executor.side_effect = responses
+
+            events = await client.get_events("session_id", "actor_id")
+
+        assert len(events) == 2
+        assert mock_executor.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_delete_events(self, client):
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.helpers.run_boto3_in_executor",
+            new_callable=AsyncMock,
+        ) as mock_executor:
+            mock_executor.side_effect = [
+                {
+                    "events": [
+                        {"eventId": "event_1"},
+                        {"eventId": "event_2"},
+                    ],
+                    "nextToken": None,
+                },
+                None,
+                None,
+            ]
+
+            await client.delete_events("session_id", "actor_id")
+
+        assert mock_executor.await_count == 3
+        first_call = mock_executor.await_args_list[0]
+        assert first_call.args[0] is client.client.list_events
+        delete_calls = mock_executor.await_args_list[1:]
+        for call in delete_calls:
+            assert call.args[0] is client.client.delete_event
+
+
 class TestEventProcessor:
     """Test suite for EventProcessor."""
 
@@ -966,3 +1138,159 @@ class TestEventProcessor:
         )
 
         assert tuple_result.parent_config is None
+
+
+class TestAsyncAgentCoreMemorySaver:
+    """Test suite for AsyncAgentCoreMemorySaver."""
+
+    @pytest.fixture
+    def mock_async_event_client(self):
+        client = Mock()
+        client.get_events = AsyncMock()
+        client.store_blob_events_batch = AsyncMock()
+        client.store_blob_event = AsyncMock()
+        client.delete_events = AsyncMock()
+        return client
+
+    @pytest.fixture
+    def memory_id(self):
+        return "test-memory-id"
+
+    @pytest.fixture
+    def async_saver(self, mock_async_event_client, memory_id):
+        with patch(
+            "langgraph_checkpoint_aws.agentcore.saver.AsyncAgentCoreEventClient",
+            return_value=mock_async_event_client,
+        ):
+            yield AsyncAgentCoreMemorySaver(memory_id=memory_id)
+
+    @pytest.fixture
+    def runnable_config(self):
+        return RunnableConfig(
+            configurable={
+                "thread_id": "test_thread_id",
+                "actor_id": "test_actor_id",
+                "checkpoint_ns": "test_namespace",
+                "checkpoint_id": "test_checkpoint_id",
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_init_creates_async_client(
+        self, async_saver, mock_async_event_client
+    ):
+        assert async_saver.memory_id == "test-memory-id"
+        assert async_saver.checkpoint_event_client is mock_async_event_client
+
+    @pytest.mark.asyncio
+    async def test_aget_tuple_success(
+        self,
+        async_saver,
+        mock_async_event_client,
+        runnable_config,
+        sample_checkpoint_event,
+        sample_channel_data_event,
+    ):
+        mock_async_event_client.get_events.return_value = [
+            sample_checkpoint_event,
+            sample_channel_data_event,
+        ]
+
+        runnable_config["configurable"].pop("checkpoint_id", None)
+
+        result = await async_saver.aget_tuple(runnable_config)
+
+        assert isinstance(result, CheckpointTuple)
+        assert result.config["configurable"]["checkpoint_id"] == "checkpoint_123"
+        mock_async_event_client.get_events.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aget_tuple_no_checkpoints(
+        self, async_saver, mock_async_event_client, runnable_config
+    ):
+        mock_async_event_client.get_events.return_value = []
+
+        result = await async_saver.aget_tuple(runnable_config)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_alist_returns_checkpoints(
+        self,
+        async_saver,
+        mock_async_event_client,
+        runnable_config,
+        sample_checkpoint_event,
+    ):
+        mock_async_event_client.get_events.return_value = [sample_checkpoint_event]
+
+        runnable_config["configurable"].pop("checkpoint_id", None)
+
+        results = [
+            item async for item in async_saver.alist(runnable_config, limit=1)
+        ]
+
+        assert len(results) == 1
+        assert isinstance(results[0], CheckpointTuple)
+
+    @pytest.mark.asyncio
+    async def test_aput_saves_events(
+        self,
+        async_saver,
+        mock_async_event_client,
+        runnable_config,
+        sample_checkpoint,
+        sample_checkpoint_metadata,
+    ):
+        runnable_config["configurable"]["checkpoint_id"] = sample_checkpoint["id"]
+
+        channel_versions = sample_checkpoint["channel_versions"]
+
+        result = await async_saver.aput(
+            runnable_config,
+            sample_checkpoint,
+            sample_checkpoint_metadata,
+            channel_versions,
+        )
+
+        mock_async_event_client.store_blob_events_batch.assert_awaited_once()
+        assert result["configurable"]["checkpoint_id"] == sample_checkpoint["id"]
+
+    @pytest.mark.asyncio
+    async def test_aput_writes_saves_event(
+        self,
+        async_saver,
+        mock_async_event_client,
+        runnable_config,
+    ):
+        await async_saver.aput_writes(
+            runnable_config,
+            [("channel", "value")],
+            task_id="task_1",
+            task_path="/path",
+        )
+
+        mock_async_event_client.store_blob_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aput_writes_missing_checkpoint(
+        self, async_saver, runnable_config
+    ):
+        runnable_config["configurable"].pop("checkpoint_id")
+
+        with pytest.raises(InvalidConfigError):
+            await async_saver.aput_writes(
+                runnable_config,
+                [("channel", "value")],
+                task_id="task_1",
+            )
+
+    @pytest.mark.asyncio
+    async def test_adelete_thread(
+        self, async_saver, mock_async_event_client
+    ):
+        await async_saver.adelete_thread("thread_id", "actor")
+
+        mock_async_event_client.delete_events.assert_awaited_once_with(
+            "thread_id", "actor"
+        )
