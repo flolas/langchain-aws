@@ -26,6 +26,7 @@ from langgraph_checkpoint_aws.agentcore.constants import (
 )
 from langgraph_checkpoint_aws.agentcore.helpers import (
     AgentCoreEventClient,
+    AsyncAgentCoreEventClient,
     EventProcessor,
     EventSerializer,
 )
@@ -303,3 +304,190 @@ class AgentCoreMemorySaver(BaseCheckpointSaver[str]):
         next_v = current_v + 1
         next_h = random.random()
         return f"{next_v:032}.{next_h:016}"
+
+
+class AsyncAgentCoreMemorySaver(BaseCheckpointSaver[str]):
+    """Asynchronous AgentCore Memory checkpoint saver."""
+
+    def __init__(
+        self,
+        memory_id: str,
+        *,
+        serde: SerializerProtocol | None = None,
+        **boto3_kwargs: Any,
+    ) -> None:
+        super().__init__(serde=serde)
+
+        self.memory_id = memory_id
+        self.serializer = EventSerializer(self.serde)
+        self.checkpoint_event_client = AsyncAgentCoreEventClient(
+            memory_id, self.serializer, **boto3_kwargs
+        )
+        self.processor = EventProcessor()
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        checkpoint_config = CheckpointerConfig.from_runnable_config(
+            RunnableConfigDict(config)
+        )
+
+        events = await self.checkpoint_event_client.get_events(
+            checkpoint_config.session_id, checkpoint_config.actor_id
+        )
+
+        checkpoints, writes_by_checkpoint, channel_data = self.processor.process_events(
+            events
+        )
+
+        if not checkpoints:
+            return None
+
+        if checkpoint_config.checkpoint_id:
+            checkpoint_event = checkpoints.get(checkpoint_config.checkpoint_id)
+            if not checkpoint_event:
+                return None
+        else:
+            latest_checkpoint_id = max(checkpoints.keys())
+            checkpoint_event = checkpoints[latest_checkpoint_id]
+
+        writes = writes_by_checkpoint.get(checkpoint_event.checkpoint_id, [])
+        return self.processor.build_checkpoint_tuple(
+            checkpoint_event, writes, channel_data, checkpoint_config
+        )
+
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        checkpoint_config = CheckpointerConfig.from_runnable_config(
+            RunnableConfigDict(config) if config else {}
+        )
+        config_checkpoint_id = get_checkpoint_id(config) if config else None
+
+        events = await self.checkpoint_event_client.get_events(
+            checkpoint_config.session_id,
+            checkpoint_config.actor_id,
+            100 if limit is None else limit,
+        )
+
+        checkpoints, writes_by_checkpoint, channel_data = self.processor.process_events(
+            events
+        )
+
+        count = 0
+        before_checkpoint_id = get_checkpoint_id(before) if before else None
+
+        for checkpoint_id in sorted(checkpoints.keys(), reverse=True):
+            checkpoint_event = checkpoints[checkpoint_id]
+
+            if config_checkpoint_id and checkpoint_id != config_checkpoint_id:
+                continue
+
+            if before_checkpoint_id and checkpoint_id >= before_checkpoint_id:
+                continue
+
+            if limit is not None and count >= limit:
+                break
+
+            writes = writes_by_checkpoint.get(checkpoint_id, [])
+
+            yield self.processor.build_checkpoint_tuple(
+                checkpoint_event, writes, channel_data, checkpoint_config
+            )
+
+            count += 1
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        checkpoint_config = CheckpointerConfig.from_runnable_config(
+            RunnableConfigDict(config)
+        )
+
+        checkpoint_copy = dict(checkpoint)
+        channel_values: dict[str, Any] = {}
+        if "channel_values" in checkpoint_copy:
+            channel_values_obj = checkpoint_copy.pop("channel_values")
+            if isinstance(channel_values_obj, dict):
+                channel_values = channel_values_obj.copy()
+
+        events_to_store: list[CheckpointEvent | ChannelDataEvent | WritesEvent] = []
+
+        for channel, version in new_versions.items():
+            channel_event = ChannelDataEvent(
+                channel=channel,
+                version=str(version),
+                value=channel_values.get(channel, EMPTY_CHANNEL_VALUE),
+                thread_id=checkpoint_config.thread_id,
+                checkpoint_ns=checkpoint_config.checkpoint_ns,
+            )
+            events_to_store.append(channel_event)
+
+        checkpoint_event = CheckpointEvent(
+            checkpoint_id=checkpoint["id"],
+            checkpoint_data=checkpoint_copy,
+            metadata=dict(get_checkpoint_metadata(config, metadata)),
+            parent_checkpoint_id=checkpoint_config.checkpoint_id,
+            thread_id=checkpoint_config.thread_id,
+            checkpoint_ns=checkpoint_config.checkpoint_ns,
+        )
+        events_to_store.append(checkpoint_event)
+
+        typed_events = cast(
+            list[CheckpointEvent | ChannelDataEvent | WritesEvent], events_to_store
+        )
+        await self.checkpoint_event_client.store_blob_events_batch(
+            typed_events, checkpoint_config.session_id, checkpoint_config.actor_id
+        )
+
+        return {
+            "configurable": {
+                "thread_id": checkpoint_config.thread_id,
+                "actor_id": checkpoint_config.actor_id,
+                "checkpoint_ns": checkpoint_config.checkpoint_ns,
+                "checkpoint_id": checkpoint["id"],
+            }
+        }
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        checkpoint_config = CheckpointerConfig.from_runnable_config(
+            RunnableConfigDict(config)
+        )
+
+        if not checkpoint_config.checkpoint_id:
+            raise InvalidConfigError("checkpoint_id is required for put_writes")
+
+        write_items = [
+            WriteItem(
+                task_id=task_id,
+                channel=channel,
+                value=value,
+                task_path=task_path,
+            )
+            for channel, value in writes
+        ]
+
+        writes_event = WritesEvent(
+            checkpoint_id=checkpoint_config.checkpoint_id,
+            writes=write_items,
+        )
+
+        await self.checkpoint_event_client.store_blob_event(
+            writes_event, checkpoint_config.session_id, checkpoint_config.actor_id
+        )
+
+    async def adelete_thread(self, thread_id: str, actor_id: str = "") -> None:
+        await self.checkpoint_event_client.delete_events(thread_id, actor_id)

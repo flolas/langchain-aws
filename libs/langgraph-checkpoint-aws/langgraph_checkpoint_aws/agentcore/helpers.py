@@ -33,6 +33,7 @@ from langgraph_checkpoint_aws.agentcore.models import (
     WriteItem,
     WritesEvent,
 )
+from langgraph_checkpoint_aws.utils import run_boto3_in_executor
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,148 @@ class AgentCoreEventClient:
                 break
             params["nextToken"] = next_token
 
+
+class AsyncAgentCoreEventClient:
+    """Asynchronous counterpart to :class:`AgentCoreEventClient`."""
+
+    def __init__(
+        self,
+        memory_id: str,
+        serializer: EventSerializer | None = None,
+        *,
+        client: Any | None = None,
+        session: boto3.Session | None = None,
+        **boto3_kwargs: Any,
+    ) -> None:
+        self.memory_id = memory_id
+
+        if serializer is None:
+            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+            self.serializer = EventSerializer(JsonPlusSerializer())
+        else:
+            self.serializer = serializer
+
+        config = boto3_kwargs.pop("config", None)
+        user_agent = "x-client-framework:langgraph_agentcore_memory"
+        if config is not None:
+            config = config.merge(Config(user_agent_extra=user_agent))
+        else:
+            config = Config(user_agent_extra=user_agent)
+
+        if client is not None:
+            self.client = client
+        else:
+            if session is None:
+                session = boto3.Session()
+            self.client = session.client(
+                "bedrock-agentcore", config=config, **boto3_kwargs
+            )
+
+    async def store_blob_event(
+        self, event: EventType, session_id: str, actor_id: str
+    ) -> None:
+        serialized = self.serializer.serialize_event(event)
+        await run_boto3_in_executor(
+            self.client.create_event,
+            memoryId=self.memory_id,
+            actorId=actor_id,
+            sessionId=session_id,
+            eventTimestamp=datetime.datetime.now(datetime.timezone.utc),
+            payload=[{"blob": serialized}],
+        )
+
+    async def store_blob_events_batch(
+        self, events: list[EventType], session_id: str, actor_id: str
+    ) -> None:
+        payload = []
+        timestamp = datetime.datetime.now(datetime.timezone.utc)
+
+        for event in events:
+            serialized = self.serializer.serialize_event(event)
+            payload.append({"blob": serialized})
+
+        await run_boto3_in_executor(
+            self.client.create_event,
+            memoryId=self.memory_id,
+            actorId=actor_id,
+            sessionId=session_id,
+            eventTimestamp=timestamp,
+            payload=payload,
+        )
+
+    async def get_events(
+        self, session_id: str, actor_id: str, limit: int = 100
+    ) -> list[EventType]:
+        if limit is not None and limit <= 0:
+            return []
+
+        all_events: list[EventType] = []
+        next_token: str | None = None
+
+        while True:
+            params: dict[str, Any] = {
+                "memoryId": self.memory_id,
+                "actorId": actor_id,
+                "sessionId": session_id,
+                "maxResults": 100,
+                "includePayloads": True,
+            }
+
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = await run_boto3_in_executor(
+                self.client.list_events, **params
+            )
+
+            for event in response.get("events", []):
+                for payload_item in event.get("payload", []):
+                    blob = payload_item.get("blob")
+                    if blob:
+                        try:
+                            parsed_event = self.serializer.deserialize_event(blob)
+                            all_events.append(parsed_event)
+                        except EventDecodingError as e:
+                            logger.warning(f"Failed to decode event: {e}")
+
+            next_token = response.get("nextToken")
+            if not next_token or (limit is not None and len(all_events) >= limit):
+                break
+
+        return all_events
+
+    async def delete_events(self, session_id: str, actor_id: str) -> None:
+        params: dict[str, Any] = {
+            "memoryId": self.memory_id,
+            "actorId": actor_id,
+            "sessionId": session_id,
+            "maxResults": 100,
+            "includePayloads": False,
+        }
+
+        while True:
+            response = await run_boto3_in_executor(
+                self.client.list_events, **params
+            )
+            events = response.get("events", [])
+
+            if not events:
+                break
+
+            for event in events:
+                await run_boto3_in_executor(
+                    self.client.delete_event,
+                    memoryId=self.memory_id,
+                    sessionId=session_id,
+                    eventId=event["eventId"],
+                    actorId=actor_id,
+                )
+
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+            params["nextToken"] = next_token
 
 class EventProcessor:
     """Processes events into checkpoint data structures."""
